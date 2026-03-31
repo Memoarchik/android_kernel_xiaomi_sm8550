@@ -1,0 +1,203 @@
+name: Build Kernel - Xiaomi 13 Ultra (SM8550)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernelsu:
+        description: 'Enable KernelSU Next'
+        required: true
+        default: 'true'
+        type: boolean
+      susfs:
+        description: 'Enable SuSFS'
+        required: true
+        default: 'true'
+        type: boolean
+
+jobs:
+  build:
+    name: Build Kernel
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            git curl wget zip unzip \
+            python3 python3-pip \
+            make bc bison flex \
+            libssl-dev libelf-dev \
+            clang lld llvm \
+            gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            cpio kmod
+
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          ref: vauxite
+          fetch-depth: 1
+
+      - name: Setup Clang toolchain
+        run: |
+          mkdir -p $HOME/clang
+          wget -q https://github.com/ZyCromerZ/Clang/releases/download/20.0.0git-20250101-release/Clang-20.0.0git-20250101.tar.gz \
+            -O clang.tar.gz
+          tar -xf clang.tar.gz -C $HOME/clang
+          echo "$HOME/clang/bin" >> $GITHUB_PATH
+
+      # ── KernelSU Next (next-susfs branch = has SuSFS hooks built-in) ──
+      - name: Setup KernelSU Next (next-susfs)
+        if: ${{ inputs.kernelsu == 'true' }}
+        run: |
+          # IMPORTANT: use next-susfs branch, NOT next
+          # next-susfs already contains SuSFS hooks - no patch 10_ needed
+          curl -LSs "https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next-susfs/kernel/setup.sh" \
+            | bash -s next-susfs
+
+          echo "=== Checking KernelSU-Next directory (note: Next not SU) ==="
+          # next-susfs setup creates KernelSU-Next/ at root and symlinks to drivers/kernelsu
+          ls KernelSU-Next/ 2>/dev/null && echo "Found: KernelSU-Next/" \
+            || echo "WARNING: KernelSU-Next/ not found at root"
+          ls drivers/kernelsu/ 2>/dev/null && echo "Found: drivers/kernelsu/" \
+            || echo "WARNING: drivers/kernelsu/ not found"
+
+          # Confirm SuSFS hooks are already present in next-susfs
+          echo "=== Verifying SuSFS hooks in next-susfs ==="
+          if grep -r "susfs" KernelSU-Next/ --include="*.c" --include="*.h" -l 2>/dev/null \
+              | grep -q .; then
+            echo "OK: SuSFS hooks confirmed in KernelSU-Next/"
+          else
+            echo "WARNING: SuSFS hooks not found - wrong branch pulled?"
+            echo "Expected branch: next-susfs"
+          fi
+
+      # ── SuSFS patches from GitLab (correct source!) ──
+      - name: Setup SuSFS
+        if: ${{ inputs.susfs == 'true' && inputs.kernelsu == 'true' }}
+        run: |
+          # Correct source: GitLab (not GitHub), branch gki-android13-5.15
+          # Kernel version is 5.15 / Android 13 = this is the right branch
+          git clone --depth=1 \
+            https://gitlab.com/simonpunk/susfs4ksu.git \
+            -b gki-android13-5.15 \
+            ../susfs4ksu
+
+          echo "=== Available patch files ==="
+          ls ../susfs4ksu/kernel_patches/
+
+          # Copy SuSFS source files
+          cp ../susfs4ksu/kernel_patches/fs/susfs.c fs/
+          cp ../susfs4ksu/kernel_patches/include/linux/susfs.h include/linux/
+          echo "OK: susfs.c and susfs.h copied"
+
+          # The correct patch filename for 5.15 / Android 13
+          PATCH_FS="../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android13-5.15.patch"
+
+          if [ ! -f "$PATCH_FS" ]; then
+            echo "ERROR: Patch file not found: $PATCH_FS"
+            echo "Available .patch files:"
+            ls ../susfs4ksu/kernel_patches/*.patch 2>/dev/null || echo "none"
+            exit 1
+          fi
+
+          echo "=== Dry-run check for fs/ patch ==="
+          if patch -p1 --dry-run < "$PATCH_FS" 2>&1; then
+            echo "Dry-run OK - applying patch"
+            patch -p1 < "$PATCH_FS"
+            echo "OK: fs/ patch applied successfully"
+          else
+            echo "ERROR: fs/ patch has conflicts!"
+            echo "--- Dry-run output ---"
+            patch -p1 --dry-run < "$PATCH_FS" 2>&1 || true
+            exit 1
+          fi
+
+          # patch 10_ is NOT needed because next-susfs already has SuSFS hooks
+          echo "Skipping patch 10_ - next-susfs branch already contains SuSFS hooks"
+
+      - name: Generate defconfig
+        run: |
+          make O=out ARCH=arm64 CC=clang \
+            LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            gki_defconfig
+
+      - name: Apply KSU + SuSFS config options
+        run: |
+          if [ "${{ inputs.kernelsu }}" == "true" ]; then
+            echo "CONFIG_KSU=y" >> out/.config
+          fi
+
+          if [ "${{ inputs.susfs }}" == "true" ]; then
+            # Search in correct directory: KernelSU-Next/ and drivers/kernelsu/
+            SUSFS_FOUND=false
+            for dir in "KernelSU-Next" "drivers/kernelsu"; do
+              if find "$dir" -name "Kconfig" 2>/dev/null \
+                  | xargs grep -l "KSU_SUSFS" 2>/dev/null \
+                  | grep -q .; then
+                echo "OK: Found SuSFS Kconfig in $dir"
+                SUSFS_FOUND=true
+                break
+              fi
+            done
+
+            if [ "$SUSFS_FOUND" = "true" ]; then
+              echo "CONFIG_KSU_SUSFS=y"             >> out/.config
+              echo "CONFIG_KSU_SUSFS_SUS_PATH=y"    >> out/.config
+              echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"   >> out/.config
+              echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"   >> out/.config
+              echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y"  >> out/.config
+              echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> out/.config
+              echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"  >> out/.config
+              echo "OK: SuSFS config options added"
+            else
+              echo "ERROR: SuSFS Kconfig not found in KernelSU-Next/ or drivers/kernelsu/"
+              echo "This should not happen with next-susfs branch - investigate setup step!"
+              exit 1
+            fi
+          fi
+
+          make O=out ARCH=arm64 CC=clang LLVM=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            olddefconfig
+
+      - name: Build kernel
+        run: |
+          make O=out ARCH=arm64 \
+            CC=clang LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            -j$(nproc --all) 2>&1 | tee build.log
+
+          if [ ! -f out/arch/arm64/boot/Image ]; then
+            echo "CRITICAL: Image not found after build!"
+            tail -80 build.log
+            exit 1
+          fi
+          echo "OK: Build successful"
+          ls -lh out/arch/arm64/boot/Image
+
+      - name: Package with AnyKernel3
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 AnyKernel3
+          cp out/arch/arm64/boot/Image AnyKernel3/
+          find out/arch/arm64/boot/dts -name "*.dtb" \
+            -exec cp {} AnyKernel3/ \; 2>/dev/null || true
+          cd AnyKernel3
+          sed -i 's/do.devicecheck=1/do.devicecheck=0/' anykernel.sh
+          zip -r9 ../kernel-sm8550-KSU-Next-SUSFS-$(date +%Y%m%d-%H%M).zip * -x .git\*
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-sm8550-${{ github.run_number }}
+          path: |
+            kernel-sm8550-*.zip
+            out/arch/arm64/boot/Image
+            build.log
+          retention-days: 7
