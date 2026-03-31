@@ -1,0 +1,222 @@
+name: Build Kernel - Xiaomi 13 Ultra (SM8550)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernelsu:
+        description: 'Enable KernelSU Next'
+        required: true
+        default: 'true'
+        type: boolean
+      susfs:
+        description: 'Enable SuSFS'
+        required: true
+        default: 'true'
+        type: boolean
+
+jobs:
+  build:
+    name: Build Kernel
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            git curl wget zip unzip \
+            python3 python3-pip \
+            make bc bison flex \
+            libssl-dev libelf-dev \
+            clang lld llvm \
+            gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            cpio kmod
+
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          ref: vauxite
+          fetch-depth: 1
+
+      - name: Setup Clang toolchain
+        run: |
+          mkdir -p $HOME/clang
+          wget -q https://github.com/ZyCromerZ/Clang/releases/download/20.0.0git-20250101-release/Clang-20.0.0git-20250101.tar.gz \
+            -O clang.tar.gz
+          tar -xf clang.tar.gz -C $HOME/clang
+          echo "$HOME/clang/bin" >> $GITHUB_PATH
+
+      - name: Setup KernelSU Next
+        if: ${{ inputs.kernelsu == 'true' }}
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next/kernel/setup.sh" | bash -s next
+
+          echo "=== KSU Next setup result ==="
+          # KSU Next places files in drivers/kernelsu/, not root KernelSU/
+          # Print where it actually landed
+          echo "Root KernelSU dir:"
+          ls KernelSU/ 2>/dev/null || echo "not found at root"
+          echo "drivers/kernelsu dir:"
+          ls drivers/kernelsu/ 2>/dev/null || echo "not found in drivers"
+
+          # Fail fast if neither location exists
+          if [ ! -d "KernelSU" ] && [ ! -d "drivers/kernelsu" ]; then
+            echo "ERROR: KSU Next setup failed - no KernelSU directory found!"
+            exit 1
+          fi
+          echo "KSU version: $(cat KernelSU/VERSION 2>/dev/null || echo 'unknown')"
+
+      - name: Setup SuSFS
+        if: ${{ inputs.susfs == 'true' && inputs.kernelsu == 'true' }}
+        run: |
+          git clone --depth=1 https://github.com/simonpunk/susfs4ksu ../susfs4ksu
+
+          echo "=== Available patch files ==="
+          ls ../susfs4ksu/kernel_patches/
+
+          # Copy SuSFS source files into kernel tree
+          echo "=== Copying susfs.c and susfs.h ==="
+          cp ../susfs4ksu/kernel_patches/fs/susfs.c fs/
+          cp ../susfs4ksu/kernel_patches/include/linux/susfs.h include/linux/
+
+          # --- Patch 1: fs/ patch for kernel 5.15 ---
+          PATCH_FS="../susfs4ksu/kernel_patches/50_add_susfs_in_fs-5.15.patch"
+
+          if [ ! -f "$PATCH_FS" ]; then
+            echo "ERROR: $PATCH_FS not found!"
+            echo "Available patches:"
+            ls ../susfs4ksu/kernel_patches/*.patch 2>/dev/null
+            exit 1
+          fi
+
+          echo "=== Dry-run: fs/ patch ==="
+          if patch -p1 --dry-run < "$PATCH_FS"; then
+            patch -p1 < "$PATCH_FS"
+            echo "OK: fs/ patch applied"
+          else
+            echo "ERROR: fs/ patch failed - conflicts detected!"
+            patch -p1 --dry-run < "$PATCH_FS" 2>&1 || true
+            exit 1
+          fi
+
+          # --- Patch 2: KSU hook patch ---
+          # KSU Next (rifsxd) may already have SuSFS hooks built-in.
+          # Search in BOTH possible locations: root KernelSU/ and drivers/kernelsu/
+          echo "=== Checking for existing SuSFS hooks in KSU Next ==="
+          KSU_HAS_SUSFS=false
+
+          for dir in "KernelSU" "drivers/kernelsu"; do
+            if [ -d "$dir" ]; then
+              if grep -r "susfs" "$dir" --include="*.c" --include="*.h" -l 2>/dev/null | grep -q .; then
+                echo "OK: SuSFS hooks already present in $dir"
+                KSU_HAS_SUSFS=true
+                break
+              fi
+            fi
+          done
+
+          if [ "$KSU_HAS_SUSFS" = "true" ]; then
+            echo "Skipping patch 10_ - KSU Next already has SuSFS hooks"
+          else
+            echo "No SuSFS hooks found - attempting to apply patch 10_"
+            KSU_PATCH="../susfs4ksu/kernel_patches/10_enable_susfs_for_ksu.patch"
+
+            if [ ! -f "$KSU_PATCH" ]; then
+              echo "WARNING: patch 10_ not found - skipping"
+            elif patch -p1 --dry-run < "$KSU_PATCH" 2>/dev/null; then
+              patch -p1 < "$KSU_PATCH"
+              echo "OK: KSU patch applied"
+            else
+              echo "WARNING: patch 10_ failed (likely incompatible with KSU Next)"
+              echo "Build will continue but SuSFS may not work correctly"
+              echo "Check this step's logs manually!"
+              # Not exiting here intentionally - let it build so we can inspect
+            fi
+          fi
+
+      - name: Generate defconfig
+        run: |
+          make O=out ARCH=arm64 CC=clang \
+            LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            gki_defconfig
+
+      - name: Apply KSU + SuSFS config options
+        run: |
+          if [ "${{ inputs.kernelsu }}" == "true" ]; then
+            echo "CONFIG_KSU=y" >> out/.config
+          fi
+
+          if [ "${{ inputs.susfs }}" == "true" ]; then
+            # Search for SuSFS Kconfig in ALL possible locations
+            # KSU Next may place it in drivers/kernelsu/ instead of root KernelSU/
+            SUSFS_KCONFIG_FOUND=false
+            for dir in "KernelSU" "drivers/kernelsu" "drivers"; do
+              if find "$dir" -name "Kconfig" -exec grep -l "KSU_SUSFS" {} \; 2>/dev/null | grep -q .; then
+                echo "Found SuSFS Kconfig in $dir"
+                SUSFS_KCONFIG_FOUND=true
+                break
+              fi
+            done
+
+            if [ "$SUSFS_KCONFIG_FOUND" = "true" ]; then
+              echo "CONFIG_KSU_SUSFS=y"             >> out/.config
+              echo "CONFIG_KSU_SUSFS_SUS_PATH=y"    >> out/.config
+              echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"   >> out/.config
+              echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"   >> out/.config
+              echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y"  >> out/.config
+              echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> out/.config
+              echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"  >> out/.config
+              echo "OK: SuSFS config options added"
+            else
+              echo "ERROR: SuSFS Kconfig not found in any known location!"
+              echo "This means patch 10_ did not apply and KSU Next has no built-in SuSFS"
+              echo "Searched in: KernelSU/, drivers/kernelsu/, drivers/"
+              echo "Build will continue WITHOUT SuSFS support!"
+            fi
+          fi
+
+          make O=out ARCH=arm64 CC=clang LLVM=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            olddefconfig
+
+      - name: Build kernel
+        run: |
+          make O=out ARCH=arm64 \
+            CC=clang LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            -j$(nproc --all) 2>&1 | tee build.log
+
+          if [ ! -f out/arch/arm64/boot/Image ]; then
+            echo "CRITICAL: Image not found after build!"
+            echo "=== Last 80 lines of build log ==="
+            tail -80 build.log
+            exit 1
+          fi
+          echo "OK: Build successful"
+          ls -lh out/arch/arm64/boot/Image
+
+      - name: Package with AnyKernel3
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 AnyKernel3
+          cp out/arch/arm64/boot/Image AnyKernel3/
+          find out/arch/arm64/boot/dts -name "*.dtb" \
+            -exec cp {} AnyKernel3/ \; 2>/dev/null || true
+          cd AnyKernel3
+          sed -i 's/do.devicecheck=1/do.devicecheck=0/' anykernel.sh
+          zip -r9 ../kernel-sm8550-KSU-$(date +%Y%m%d-%H%M).zip * -x .git\*
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-sm8550-${{ github.run_number }}
+          path: |
+            kernel-sm8550-*.zip
+            out/arch/arm64/boot/Image
+            build.log
+          retention-days: 7
