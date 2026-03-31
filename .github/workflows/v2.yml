@@ -1,0 +1,227 @@
+name: Build Kernel - Xiaomi 13 Ultra (SM8550)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernelsu:
+        description: 'Enable KernelSU Next'
+        required: true
+        default: 'true'
+        type: boolean
+      susfs:
+        description: 'Enable SuSFS'
+        required: true
+        default: 'true'
+        type: boolean
+
+jobs:
+  build:
+    name: Build Kernel
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Free disk space and add swap
+        run: |
+          # Remove large unused packages to reclaim ~8GB of disk space
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/local/share/boost
+          # AGENT_TOOLSDIRECTORY may be unset; only remove if defined
+          [ -n "${AGENT_TOOLSDIRECTORY}" ] && sudo rm -rf "${AGENT_TOOLSDIRECTORY}" || true
+          sudo apt-get clean
+          df -h
+
+          # Disable and remove any existing swapfile to avoid "Text file busy" error
+          sudo swapoff /swapfile 2>/dev/null || true
+          sudo rm -f /swapfile
+
+          # Create 12GB swap - required for Clang LTO linking (~12-16GB RAM needed)
+          # fallocate is fast; fall back to dd if the filesystem does not support it
+          sudo fallocate -l 12G /swapfile || \
+            sudo dd if=/dev/zero of=/swapfile bs=1M count=12288 status=progress
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+
+          # Keep swappiness low so swap is only used under real memory pressure
+          echo "vm.swappiness=10" | sudo tee -a /etc/sysctl.conf
+          sudo sysctl -p
+          free -h
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            git curl wget zip unzip \
+            python3 python3-pip \
+            make bc bison flex \
+            libssl-dev libelf-dev \
+            clang lld llvm \
+            gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            cpio kmod \
+            dwarves
+
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          ref: vauxite
+          fetch-depth: 1
+
+      - name: Setup Clang 20 toolchain
+        run: |
+          mkdir -p "$HOME/clang"
+          wget -q \
+            https://github.com/ZyCromerZ/Clang/releases/download/20.0.0git-20250101-release/Clang-20.0.0git-20250101.tar.gz \
+            -O /tmp/clang.tar.gz
+          tar -xf /tmp/clang.tar.gz -C "$HOME/clang"
+          rm -f /tmp/clang.tar.gz
+          # Prepend custom Clang to PATH so it takes priority over the system one
+          echo "$HOME/clang/bin" >> "$GITHUB_PATH"
+
+      # Using official KernelSU-Next (next branch) + manual SuSFS patches.
+      # pershoot/next-susfs targets kernel 6.1 only - incompatible with 5.15.
+      # rifsxd/next-susfs has a known compile bug on 5.15 (issue #426).
+      - name: Setup KernelSU Next
+        if: ${{ inputs.kernelsu == 'true' }}
+        run: |
+          curl -LSs \
+            "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
+            | bash -s stable
+
+          # setup.sh clones into KernelSU-Next/ and symlinks drivers/kernelsu -> KernelSU-Next/kernel
+          echo "=== Verifying KSU directory structure ==="
+          ls KernelSU-Next/        || { echo "ERROR: KernelSU-Next/ not found";        exit 1; }
+          ls KernelSU-Next/kernel/ || { echo "ERROR: KernelSU-Next/kernel/ not found"; exit 1; }
+          ls -la drivers/kernelsu  || { echo "ERROR: drivers/kernelsu symlink missing"; exit 1; }
+
+      - name: Setup SuSFS
+        if: ${{ inputs.susfs == 'true' && inputs.kernelsu == 'true' }}
+        run: |
+          # gki-android13-5.15 is the correct branch for kernel 5.15 / Android 13
+          git clone --depth=1 \
+            https://gitlab.com/simonpunk/susfs4ksu.git \
+            -b gki-android13-5.15 \
+            ../susfs4ksu
+
+          echo "=== Available patch files ==="
+          ls ../susfs4ksu/kernel_patches/
+
+          # Copy SuSFS source files into the kernel tree
+          cp ../susfs4ksu/kernel_patches/fs/susfs.c            fs/
+          cp ../susfs4ksu/kernel_patches/include/linux/susfs.h include/linux/
+          echo "OK: susfs.c and susfs.h copied"
+
+          # Patch 1: wire SuSFS hooks into KernelSU-Next (apply inside KernelSU-Next/, not kernel root)
+          echo "=== Applying patch 10_ inside KernelSU-Next/ ==="
+          cd KernelSU-Next
+          if patch -p1 --dry-run < ../../susfs4ksu/kernel_patches/10_enable_susfs_for_ksu.patch 2>&1; then
+            patch -p1 < ../../susfs4ksu/kernel_patches/10_enable_susfs_for_ksu.patch
+            echo "OK: patch 10_ applied"
+          else
+            echo "ERROR: patch 10_ rejected - aborting"
+            exit 1
+          fi
+          cd ..
+
+          # Patch 2: wire SuSFS hooks into kernel fs/ (apply from kernel root)
+          echo "=== Applying patch 50_ at kernel root ==="
+          PATCH_FS="../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android13-5.15.patch"
+          if [ ! -f "$PATCH_FS" ]; then
+            echo "ERROR: patch file not found: $PATCH_FS"
+            ls ../susfs4ksu/kernel_patches/*.patch || true
+            exit 1
+          fi
+          if patch -p1 --dry-run < "$PATCH_FS" 2>&1; then
+            patch -p1 < "$PATCH_FS"
+            echo "OK: patch 50_ applied"
+          else
+            echo "ERROR: patch 50_ rejected - aborting"
+            exit 1
+          fi
+
+          # Verify that Kconfig was updated by patch 10_
+          echo "=== Verifying SuSFS entries in Kconfig ==="
+          grep -q "KSU_SUSFS" KernelSU-Next/kernel/Kconfig \
+            && echo "OK: KSU_SUSFS found in Kconfig" \
+            || { echo "ERROR: KSU_SUSFS missing from Kconfig after patching"; \
+                 cat KernelSU-Next/kernel/Kconfig; exit 1; }
+
+      - name: Generate base defconfig
+        run: |
+          make O=out ARCH=arm64 \
+            CC=clang LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            gki_defconfig
+
+      - name: Append KSU and SuSFS config options
+        run: |
+          if [ "${{ inputs.kernelsu }}" == "true" ]; then
+            echo "CONFIG_KSU=y" >> out/.config
+            echo "OK: CONFIG_KSU added"
+          fi
+          if [ "${{ inputs.susfs }}" == "true" ]; then
+            {
+              echo "CONFIG_KSU_SUSFS=y"
+              echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
+              echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
+              echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
+              echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y"
+              echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
+              echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
+            } >> out/.config
+            echo "OK: SuSFS config options added"
+          fi
+
+          # Resolve any new symbols introduced by the appended options
+          make O=out ARCH=arm64 \
+            CC=clang LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            olddefconfig
+
+      - name: Build kernel
+        run: |
+          make O=out ARCH=arm64 \
+            CC=clang LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            KCFLAGS="-Wno-error=unused-variable -Wno-error=unused-function" \
+            -j$(nproc) 2>&1 | tee build.log
+
+          if [ ! -f out/arch/arm64/boot/Image ]; then
+            echo "CRITICAL: Image not found - build failed"
+            tail -150 build.log
+            exit 1
+          fi
+          echo "OK: build successful"
+          ls -lh out/arch/arm64/boot/Image
+
+      - name: Package with AnyKernel3
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 AnyKernel3
+          cp out/arch/arm64/boot/Image AnyKernel3/
+
+          # Copy device tree blobs if present (not fatal if missing)
+          find out/arch/arm64/boot/dts -name "*.dtb" \
+            -exec cp {} AnyKernel3/ \; 2>/dev/null || true
+
+          cd AnyKernel3
+          # Disable device check so the zip flashes on any device
+          sed -i 's/do.devicecheck=1/do.devicecheck=0/' anykernel.sh
+          zip -r9 ../kernel-sm8550-KSU-Next-SUSFS-$(date +%Y%m%d-%H%M).zip . -x '.git*'
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-sm8550-${{ github.run_number }}
+          path: |
+            kernel-sm8550-*.zip
+            out/arch/arm64/boot/Image
+            build.log
+          retention-days: 7
