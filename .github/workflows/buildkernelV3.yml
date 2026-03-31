@@ -47,38 +47,36 @@ jobs:
           tar -xf clang.tar.gz -C $HOME/clang
           echo "$HOME/clang/bin" >> $GITHUB_PATH
 
-      # ── KernelSU Next (next-susfs branch = has SuSFS hooks built-in) ──
-      - name: Setup KernelSU Next (next-susfs)
+      - name: Setup KernelSU Next (next-susfs via pershoot)
         if: ${{ inputs.kernelsu == 'true' }}
         run: |
-          # IMPORTANT: use next-susfs branch, NOT next
-          # next-susfs already contains SuSFS hooks - no patch 10_ needed
-          curl -LSs "https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next-susfs/kernel/setup.sh" \
+          # pershoot/KernelSU-Next next-susfs = KSU Next with SuSFS already integrated
+          curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/refs/heads/next-susfs/kernel/setup.sh" \
             | bash -s next-susfs
 
-          echo "=== Checking KernelSU-Next directory (note: Next not SU) ==="
-          # next-susfs setup creates KernelSU-Next/ at root and symlinks to drivers/kernelsu
-          ls KernelSU-Next/ 2>/dev/null && echo "Found: KernelSU-Next/" \
-            || echo "WARNING: KernelSU-Next/ not found at root"
-          ls drivers/kernelsu/ 2>/dev/null && echo "Found: drivers/kernelsu/" \
-            || echo "WARNING: drivers/kernelsu/ not found"
+          # setup.sh clones repo into KernelSU-Next/ and creates:
+          # drivers/kernelsu -> symlink to KernelSU-Next/kernel
+          # We must search KernelSU-Next/kernel/ directly, NOT via symlink
+          echo "=== Directory structure after KSU setup ==="
+          ls -la KernelSU-Next/ 2>/dev/null || echo "KernelSU-Next/ not found!"
+          ls -la KernelSU-Next/kernel/ 2>/dev/null || echo "KernelSU-Next/kernel/ not found!"
+          echo "=== Symlink check ==="
+          ls -la drivers/kernelsu 2>/dev/null || echo "drivers/kernelsu symlink not found!"
 
-          # Confirm SuSFS hooks are already present in next-susfs
-          echo "=== Verifying SuSFS hooks in next-susfs ==="
-          if grep -r "susfs" KernelSU-Next/ --include="*.c" --include="*.h" -l 2>/dev/null \
-              | grep -q .; then
-            echo "OK: SuSFS hooks confirmed in KernelSU-Next/"
+          # Verify SuSFS is present in next-susfs branch (direct path, no symlink)
+          if grep -q "KSU_SUSFS" KernelSU-Next/kernel/Kconfig 2>/dev/null; then
+            echo "OK: SuSFS found in KernelSU-Next/kernel/Kconfig"
           else
-            echo "WARNING: SuSFS hooks not found - wrong branch pulled?"
-            echo "Expected branch: next-susfs"
+            echo "ERROR: KSU_SUSFS not found in KernelSU-Next/kernel/Kconfig"
+            echo "--- Kconfig content ---"
+            cat KernelSU-Next/kernel/Kconfig || echo "File not found"
+            exit 1
           fi
 
-      # ── SuSFS patches from GitLab (correct source!) ──
       - name: Setup SuSFS
         if: ${{ inputs.susfs == 'true' && inputs.kernelsu == 'true' }}
         run: |
-          # Correct source: GitLab (not GitHub), branch gki-android13-5.15
-          # Kernel version is 5.15 / Android 13 = this is the right branch
+          # Source: GitLab (not GitHub!), branch gki-android13-5.15 for kernel 5.15
           git clone --depth=1 \
             https://gitlab.com/simonpunk/susfs4ksu.git \
             -b gki-android13-5.15 \
@@ -87,35 +85,31 @@ jobs:
           echo "=== Available patch files ==="
           ls ../susfs4ksu/kernel_patches/
 
-          # Copy SuSFS source files
+          # Copy SuSFS source files into kernel tree
           cp ../susfs4ksu/kernel_patches/fs/susfs.c fs/
           cp ../susfs4ksu/kernel_patches/include/linux/susfs.h include/linux/
           echo "OK: susfs.c and susfs.h copied"
 
-          # The correct patch filename for 5.15 / Android 13
+          # Correct patch filename for Android 13 / kernel 5.15
           PATCH_FS="../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android13-5.15.patch"
 
           if [ ! -f "$PATCH_FS" ]; then
-            echo "ERROR: Patch file not found: $PATCH_FS"
+            echo "ERROR: patch not found: $PATCH_FS"
             echo "Available .patch files:"
-            ls ../susfs4ksu/kernel_patches/*.patch 2>/dev/null || echo "none"
+            ls ../susfs4ksu/kernel_patches/*.patch 2>/dev/null || echo "none found"
             exit 1
           fi
 
-          echo "=== Dry-run check for fs/ patch ==="
-          if patch -p1 --dry-run < "$PATCH_FS" 2>&1; then
-            echo "Dry-run OK - applying patch"
+          echo "=== Dry-run: fs/ patch ==="
+          if patch -p1 --dry-run < "$PATCH_FS"; then
             patch -p1 < "$PATCH_FS"
-            echo "OK: fs/ patch applied successfully"
+            echo "OK: fs/ patch applied"
           else
-            echo "ERROR: fs/ patch has conflicts!"
-            echo "--- Dry-run output ---"
-            patch -p1 --dry-run < "$PATCH_FS" 2>&1 || true
+            echo "ERROR: fs/ patch has conflicts - see output above"
             exit 1
           fi
 
-          # patch 10_ is NOT needed because next-susfs already has SuSFS hooks
-          echo "Skipping patch 10_ - next-susfs branch already contains SuSFS hooks"
+          # patch 10_ is NOT needed: pershoot/next-susfs already includes KSU hooks for SuSFS
 
       - name: Generate defconfig
         run: |
@@ -132,19 +126,9 @@ jobs:
           fi
 
           if [ "${{ inputs.susfs }}" == "true" ]; then
-            # Search in correct directory: KernelSU-Next/ and drivers/kernelsu/
-            SUSFS_FOUND=false
-            for dir in "KernelSU-Next" "drivers/kernelsu"; do
-              if find "$dir" -name "Kconfig" 2>/dev/null \
-                  | xargs grep -l "KSU_SUSFS" 2>/dev/null \
-                  | grep -q .; then
-                echo "OK: Found SuSFS Kconfig in $dir"
-                SUSFS_FOUND=true
-                break
-              fi
-            done
-
-            if [ "$SUSFS_FOUND" = "true" ]; then
+            # Direct check - no find/symlink involved
+            if grep -q "KSU_SUSFS" KernelSU-Next/kernel/Kconfig 2>/dev/null; then
+              echo "OK: SuSFS Kconfig confirmed - adding config options"
               echo "CONFIG_KSU_SUSFS=y"             >> out/.config
               echo "CONFIG_KSU_SUSFS_SUS_PATH=y"    >> out/.config
               echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"   >> out/.config
@@ -152,10 +136,10 @@ jobs:
               echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y"  >> out/.config
               echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> out/.config
               echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"  >> out/.config
-              echo "OK: SuSFS config options added"
             else
-              echo "ERROR: SuSFS Kconfig not found in KernelSU-Next/ or drivers/kernelsu/"
-              echo "This should not happen with next-susfs branch - investigate setup step!"
+              echo "ERROR: SuSFS Kconfig not found in KernelSU-Next/kernel/Kconfig"
+              echo "--- Kconfig dump ---"
+              cat KernelSU-Next/kernel/Kconfig || echo "File missing"
               exit 1
             fi
           fi
