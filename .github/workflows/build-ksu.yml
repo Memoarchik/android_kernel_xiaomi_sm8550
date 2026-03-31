@@ -58,14 +58,11 @@ jobs:
         if: ${{ inputs.susfs == 'true' && inputs.kernelsu == 'true' }}
         run: |
           git clone --depth=1 https://github.com/simonpunk/susfs4ksu ../susfs4ksu
-          # Копіюємо вихідні файли
           cp ../susfs4ksu/kernel_patches/fs/susfs.c fs/
           cp ../susfs4ksu/kernel_patches/include/linux/susfs.h include/linux/
-          # Патчимо fs/
           cd ..
           patch -p1 --no-backup-if-mismatch -d android_kernel_xiaomi_sm8550 \
             < susfs4ksu/kernel_patches/50_add_susfs_in_fs-5.15.patch || true
-          # Патчимо KSU для підтримки susfs
           patch -p1 --no-backup-if-mismatch -d android_kernel_xiaomi_sm8550 \
             < susfs4ksu/kernel_patches/10_enable_susfs_for_ksu.patch || true
           cd android_kernel_xiaomi_sm8550
@@ -100,7 +97,6 @@ jobs:
             echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"       >> out/.config
             echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"        >> out/.config
           fi
-          # Оновити конфіг (підтвердити нові опції дефолтами)
           make O=out ARCH=arm64 CC=clang LLVM=1 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CLANG_TRIPLE=aarch64-linux-gnu- \
@@ -131,10 +127,8 @@ jobs:
         run: |
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3 AnyKernel3
           cp out/arch/arm64/boot/Image AnyKernel3/
-          # Якщо є dtb/dtbo
           find out/arch/arm64/boot/dts -name "*.dtb" -exec cp {} AnyKernel3/ \; 2>/dev/null || true
           cd AnyKernel3
-          # Налаштуй anykernel.sh під свій пристрій
           sed -i 's/do.devicecheck=1/do.devicecheck=0/' anykernel.sh
           zip -r9 ../kernel-sm8550-KSU-$(date +%Y%m%d-%H%M).zip * -x .git\*
           cd ..
