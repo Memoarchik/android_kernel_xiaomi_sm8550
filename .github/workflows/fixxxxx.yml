@@ -1,0 +1,301 @@
+name: Build Kernel - Xiaomi 13 Ultra (SM8550)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernelsu:
+        description: 'Enable KernelSU Next'
+        required: true
+        default: 'true'
+        type: boolean
+      susfs:
+        description: 'Enable SuSFS'
+        required: true
+        default: 'true'
+        type: boolean
+
+jobs:
+  build:
+    name: Build Kernel
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Free disk space and add swap
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
+          [ -n "${AGENT_TOOLSDIRECTORY}" ] && sudo rm -rf "${AGENT_TOOLSDIRECTORY}" || true
+          sudo apt-get clean
+          sudo swapoff /swapfile 2>/dev/null || true
+          sudo rm -f /swapfile
+          sudo fallocate -l 12G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=12288
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          echo "vm.swappiness=10" | sudo tee -a /etc/sysctl.conf
+          sudo sysctl -p
+          df -h && free -h
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            git curl wget zip unzip \
+            python3 python3-pip \
+            make bc bison flex \
+            libssl-dev libelf-dev \
+            clang lld llvm \
+            gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            cpio kmod dwarves
+
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          ref: vauxite
+          fetch-depth: 1
+
+      - name: Setup Clang 20 toolchain
+        run: |
+          mkdir -p "$HOME/clang"
+          wget -q \
+            https://github.com/ZyCromerZ/Clang/releases/download/20.0.0git-20250101-release/Clang-20.0.0git-20250101.tar.gz \
+            -O /tmp/clang.tar.gz
+          tar -xf /tmp/clang.tar.gz -C "$HOME/clang"
+          rm -f /tmp/clang.tar.gz
+          echo "$HOME/clang/bin" >> "$GITHUB_PATH"
+
+      - name: Setup KernelSU Next
+        if: ${{ inputs.kernelsu == 'true' }}
+        run: |
+          curl -LSs \
+            "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
+            | bash -s stable
+
+          echo "=== KSU directory check ==="
+          ls KernelSU-Next/kernel/ || { echo "ERROR: KernelSU-Next/kernel/ not found"; exit 1; }
+          ls -la drivers/kernelsu  || { echo "ERROR: drivers/kernelsu symlink missing"; exit 1; }
+
+          echo "=== KSU version ==="
+          cat KernelSU-Next/kernel/Makefile | grep "KSU_VERSION" | head -3
+
+      # Manual VFS Hooks: required for Qualcomm kernels where kprobes are broken/unreliable.
+      # kprobes on sm8550 Xiaomi kernel = "unknown kernel" in KSU manager because hooks don't fire.
+      # Manual hooks patch execve/open/read/stat directly in kernel source = reliable on any kernel.
+      - name: Apply KernelSU Manual VFS Hooks
+        if: ${{ inputs.kernelsu == 'true' }}
+        run: |
+          KSUDIR="KernelSU-Next/kernel"
+
+          # Hook 1: execve - main hook for su compat
+          # KernelSU needs to intercept do_execveat_common in fs/exec.c
+          if grep -q "ksu_handle_execveat" fs/exec.c; then
+            echo "execve hook already present"
+          else
+            # Find the right injection point
+            if grep -q "do_execveat_common" fs/exec.c; then
+              sed -i '/int do_execveat_common/,/^{/{
+                /^{/a\\
+\textern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);\
+\tksu_handle_execveat(&fd, &filename, argv, envp, &flags);
+              }' fs/exec.c
+              echo "OK: execve hook applied to fs/exec.c"
+            else
+              echo "WARNING: do_execveat_common not found in fs/exec.c - skipping"
+            fi
+          fi
+
+          # Hook 2: open - for /proc/self/attr/prev reading
+          if grep -q "ksu_handle_faccessat" fs/open.c; then
+            echo "open hook already present"
+          else
+            if grep -q "do_faccessat" fs/open.c; then
+              sed -i '/^long do_faccessat/,/^{/{
+                /^{/a\\
+\textern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);\
+\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);
+              }' fs/open.c
+              echo "OK: faccessat hook applied to fs/open.c"
+            else
+              echo "WARNING: do_faccessat not found in fs/open.c - skipping"
+            fi
+          fi
+
+          # Hook 3: read - for /proc/self/attr/current reading
+          if grep -q "ksu_handle_vfs_read" fs/read_write.c; then
+            echo "read hook already present"
+          else
+            if grep -q "vfs_read" fs/read_write.c; then
+              sed -i '/^ssize_t vfs_read/,/^{/{
+                /^{/a\\
+\textern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr, size_t *count_ptr, loff_t **pos);\
+\tksu_handle_vfs_read(&file, &buf, &count, &pos);
+              }' fs/read_write.c
+              echo "OK: vfs_read hook applied to fs/read_write.c"
+            else
+              echo "WARNING: vfs_read not found in fs/read_write.c - skipping"
+            fi
+          fi
+
+          # Hook 4: stat - hide KSU files from detection
+          if grep -q "ksu_handle_stat" fs/stat.c; then
+            echo "stat hook already present"
+          else
+            if grep -q "vfs_statx" fs/stat.c || grep -q "vfs_fstatat" fs/stat.c; then
+              TARGET_FN=$(grep -l "vfs_statx\|vfs_fstatat" fs/stat.c | head -1)
+              sed -i '/^int vfs_statx\|^int vfs_fstatat/,/^{/{
+                /^{/a\\
+\textern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\
+\tksu_handle_stat(&dfd, &filename, &flags);
+              }' fs/stat.c
+              echo "OK: stat hook applied to fs/stat.c"
+            else
+              echo "WARNING: vfs_statx not found in fs/stat.c - skipping"
+            fi
+          fi
+
+          echo "=== Manual hooks summary ==="
+          grep -l "ksu_handle" fs/exec.c fs/open.c fs/read_write.c fs/stat.c 2>/dev/null \
+            && echo "Hooks confirmed in above files" || echo "WARNING: some hooks may be missing"
+
+      - name: Setup SuSFS
+        if: ${{ inputs.susfs == 'true' && inputs.kernelsu == 'true' }}
+        run: |
+          git clone --depth=1 \
+            https://gitlab.com/simonpunk/susfs4ksu.git \
+            -b gki-android13-5.15 \
+            ../susfs4ksu
+
+          echo "=== Available patch files ==="
+          ls ../susfs4ksu/kernel_patches/
+
+          cp ../susfs4ksu/kernel_patches/fs/susfs.c            fs/
+          cp ../susfs4ksu/kernel_patches/include/linux/susfs.h include/linux/
+          echo "OK: susfs.c and susfs.h copied"
+
+          # Patch 10_: wire SuSFS into KernelSU-Next (inside KernelSU-Next dir)
+          echo "=== Applying patch 10_ ==="
+          cd KernelSU-Next
+          if patch -p1 --dry-run < ../../susfs4ksu/kernel_patches/10_enable_susfs_for_ksu.patch 2>&1; then
+            patch -p1 < ../../susfs4ksu/kernel_patches/10_enable_susfs_for_ksu.patch
+            echo "OK: patch 10_ applied"
+          else
+            echo "ERROR: patch 10_ rejected"
+            exit 1
+          fi
+          cd ..
+
+          # Patch 50_: wire SuSFS into kernel fs/ (from kernel root)
+          echo "=== Applying patch 50_ ==="
+          PATCH_FS="../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android13-5.15.patch"
+          [ -f "$PATCH_FS" ] || { echo "ERROR: $PATCH_FS not found"; ls ../susfs4ksu/kernel_patches/*.patch; exit 1; }
+          if patch -p1 --dry-run < "$PATCH_FS" 2>&1; then
+            patch -p1 < "$PATCH_FS"
+            echo "OK: patch 50_ applied"
+          else
+            echo "ERROR: patch 50_ rejected"
+            exit 1
+          fi
+
+          grep -q "KSU_SUSFS" KernelSU-Next/kernel/Kconfig \
+            && echo "OK: KSU_SUSFS confirmed in Kconfig" \
+            || { echo "ERROR: KSU_SUSFS missing from Kconfig"; exit 1; }
+
+      - name: Generate base defconfig
+        run: |
+          make O=out ARCH=arm64 \
+            CC=clang LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            gki_defconfig
+
+      - name: Append KSU and SuSFS config options
+        run: |
+          CFG=out/.config
+
+          if [ "${{ inputs.kernelsu }}" == "true" ]; then
+            echo "CONFIG_KSU=y"               >> "$CFG"
+            # Use manual hooks - kprobes unreliable on Qualcomm vendor kernels
+            echo "CONFIG_KSU_WITH_KPROBES=n"  >> "$CFG"
+            # Keep kprobes enabled for other kernel subsystems, just not for KSU
+            echo "CONFIG_KPROBES=y"           >> "$CFG"
+            echo "CONFIG_HAVE_KPROBES=y"      >> "$CFG"
+            echo "CONFIG_KPROBE_EVENTS=y"     >> "$CFG"
+            echo "CONFIG_KALLSYMS=y"          >> "$CFG"
+            echo "CONFIG_KALLSYMS_ALL=y"      >> "$CFG"
+            echo "CONFIG_OVERLAY_FS=y"        >> "$CFG"
+            echo "OK: KSU options written"
+          fi
+
+          if [ "${{ inputs.susfs }}" == "true" ]; then
+            echo "CONFIG_KSU_SUSFS=y"             >> "$CFG"
+            echo "CONFIG_KSU_SUSFS_SUS_PATH=y"    >> "$CFG"
+            echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"   >> "$CFG"
+            echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"   >> "$CFG"
+            echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y"  >> "$CFG"
+            echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> "$CFG"
+            echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"  >> "$CFG"
+            echo "OK: SuSFS options written"
+          fi
+
+          make O=out ARCH=arm64 \
+            CC=clang LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            olddefconfig
+
+          # Verify CONFIG_KSU survived olddefconfig
+          echo "=== Config verification ==="
+          grep "CONFIG_KSU=" out/.config || echo "WARNING: CONFIG_KSU not found!"
+          grep "CONFIG_KSU_WITH_KPROBES" out/.config || echo "INFO: CONFIG_KSU_WITH_KPROBES not in config (may be n by default)"
+          grep "CONFIG_KSU_SUSFS=" out/.config || echo "WARNING: CONFIG_KSU_SUSFS not found!"
+
+          # If CONFIG_KSU was dropped - it means Kconfig isn't sourced = critical fail
+          if ! grep -q "CONFIG_KSU=y" out/.config; then
+            echo "CRITICAL: CONFIG_KSU=y was dropped by olddefconfig"
+            echo "This means drivers/Kconfig doesn't source KernelSU Kconfig"
+            echo "--- drivers/Kconfig last 15 lines ---"
+            tail -15 drivers/Kconfig
+            echo "--- drivers/kernelsu symlink ---"
+            ls -la drivers/kernelsu 2>/dev/null || echo "(MISSING)"
+            exit 1
+          fi
+          echo "OK: CONFIG_KSU=y confirmed in final config"
+
+      - name: Build kernel
+        run: |
+          make O=out ARCH=arm64 \
+            CC=clang LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            KCFLAGS="-Wno-error=unused-variable -Wno-error=unused-function" \
+            -j$(nproc) 2>&1 | tee build.log
+
+          if [ ! -f out/arch/arm64/boot/Image ]; then
+            echo "CRITICAL: Image not found - build failed"
+            tail -150 build.log
+            exit 1
+          fi
+          echo "OK: build successful"
+          ls -lh out/arch/arm64/boot/Image
+
+      - name: Package with AnyKernel3
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 AnyKernel3
+          cp out/arch/arm64/boot/Image AnyKernel3/
+          find out/arch/arm64/boot/dts -name "*.dtb" \
+            -exec cp {} AnyKernel3/ \; 2>/dev/null || true
+          cd AnyKernel3
+          sed -i 's/do.devicecheck=1/do.devicecheck=0/' anykernel.sh
+          zip -r9 ../kernel-sm8550-KSU-Next-SUSFS-$(date +%Y%m%d-%H%M).zip . -x '.git*'
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-sm8550-${{ github.run_number }}
+          path: |
+            kernel-sm8550-*.zip
+            out/arch/arm64/boot/Image
+            build.log
+          retention-days: 7
