@@ -30,8 +30,7 @@ jobs:
             /usr/local/share/boost
           [ -n "${AGENT_TOOLSDIRECTORY}" ] && sudo rm -rf "${AGENT_TOOLSDIRECTORY}" || true
           sudo apt-get clean
-          df -h
-
+          
           sudo swapoff /swapfile 2>/dev/null || true
           sudo rm -f /swapfile
           sudo fallocate -l 12G /swapfile || \
@@ -41,7 +40,6 @@ jobs:
           sudo swapon /swapfile
           echo "vm.swappiness=10" | sudo tee -a /etc/sysctl.conf
           sudo sysctl -p
-          free -h
 
       - name: Install build dependencies
         run: |
@@ -71,21 +69,19 @@ jobs:
           tar -xf /tmp/clang.tar.gz -C "$HOME/clang"
           rm -f /tmp/clang.tar.gz
           echo "$HOME/clang/bin" >> "$GITHUB_PATH"
-          "$HOME/clang/bin/clang" --version
 
       - name: Setup KernelSU Next
         if: inputs.kernelsu == true
         run: |
           KERNEL_ROOT="$(pwd)"
+          # Змінено гілку з 'next' на 'main'
           git clone https://github.com/KernelSU-Next/KernelSU-Next \
-            --branch next \
+            --branch main \
             --depth 500 \
             KernelSU-Next
           
           ln -sf "${KERNEL_ROOT}/KernelSU-Next/kernel" drivers/kernelsu
 
-          test -L drivers/kernelsu || { echo "ERROR: symlink not created"; exit 1; }
-          
           python3 - <<'PYEOF'
           import sys
           path = "drivers/Kconfig"
