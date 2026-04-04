@@ -1,0 +1,301 @@
+name: Build Kernel - Xiaomi 13 Ultra (SM8550)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernelsu:
+        description: 'Enable KernelSU Next'
+        required: true
+        default: 'true'
+        type: boolean
+      susfs:
+        description: 'Enable SuSFS'
+        required: true
+        default: 'true'
+        type: boolean
+
+jobs:
+  build:
+    name: Build Kernel
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Free disk space and add swap
+        run: |
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/local/share/boost
+          [ -n "${AGENT_TOOLSDIRECTORY}" ] && sudo rm -rf "${AGENT_TOOLSDIRECTORY}" || true
+          sudo apt-get clean
+          df -h
+
+          sudo swapoff /swapfile 2>/dev/null || true
+          sudo rm -f /swapfile
+          sudo fallocate -l 12G /swapfile || \
+            sudo dd if=/dev/zero of=/swapfile bs=1M count=12288 status=progress
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          echo "vm.swappiness=10" | sudo tee -a /etc/sysctl.conf
+          sudo sysctl -p
+          free -h
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            git curl wget zip unzip \
+            python3 python3-pip \
+            make bc bison flex \
+            libssl-dev libelf-dev \
+            clang lld llvm \
+            gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            cpio kmod dwarves
+
+      # fetch-depth: 0 is REQUIRED for correct KSU versioning.
+      # KernelSU-Next uses `git rev-list --count HEAD` to version itself.
+      # With fetch-depth: 1 the count is 1 and the manager shows "unknown kernel".
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          ref: vauxite
+          fetch-depth: 0
+
+      - name: Setup Clang 20 toolchain
+        run: |
+          mkdir -p "$HOME/clang"
+          wget -q \
+            https://github.com/ZyCromerZ/Clang/releases/download/20.0.0git-20250101-release/Clang-20.0.0git-20250101.tar.gz \
+            -O /tmp/clang.tar.gz
+          tar -xf /tmp/clang.tar.gz -C "$HOME/clang"
+          rm -f /tmp/clang.tar.gz
+          echo "$HOME/clang/bin" >> "$GITHUB_PATH"
+          "$HOME/clang/bin/clang" --version
+
+      # Manual KSU integration without curl|bash setup.sh.
+      # setup.sh silently fails in piped execution and has operator-precedence
+      # bugs in its Kconfig/Makefile idempotency checks.
+      - name: Setup KernelSU Next
+        if: ${{ inputs.kernelsu == 'true' }}
+        run: |
+          KERNEL_ROOT="$(pwd)"
+
+          # Clone with enough depth so git rev-list --count gives real version
+          git clone https://github.com/KernelSU-Next/KernelSU-Next \
+            --branch next \
+            --depth 500 \
+            KernelSU-Next
+          echo "KSU commits: $(git -C KernelSU-Next rev-list --count HEAD)"
+
+          # Create symlink with absolute path - avoids all relative path issues
+          ln -sf "${KERNEL_ROOT}/KernelSU-Next/kernel" drivers/kernelsu
+
+          # Verify symlink is valid before touching Kconfig/Makefile
+          test -L drivers/kernelsu         || { echo "ERROR: symlink not created";      exit 1; }
+          test -d drivers/kernelsu         || { echo "ERROR: symlink target not a dir"; exit 1; }
+          test -f drivers/kernelsu/Kconfig || { echo "ERROR: KernelSU Kconfig missing"; exit 1; }
+          echo "OK: drivers/kernelsu -> $(readlink drivers/kernelsu)"
+
+          # Wire KSU into drivers/Kconfig using Python.
+          # sed '/endmenu/i ...' is fragile with multiple endmenu tokens and
+          # special characters. Python rfind is unambiguous.
+          python3 - <<'PYEOF'
+import sys
+path = "drivers/Kconfig"
+content = open(path).read()
+entry = '\nsource "drivers/kernelsu/Kconfig"\n'
+if 'drivers/kernelsu/Kconfig' in content:
+    print("OK: drivers/Kconfig already has KSU entry")
+else:
+    idx = content.rfind("endmenu")
+    if idx == -1:
+        print("ERROR: 'endmenu' not found in drivers/Kconfig", file=sys.stderr)
+        sys.exit(1)
+    content = content[:idx] + entry + content[idx:]
+    open(path, "w").write(content)
+    print("OK: KSU source injected into drivers/Kconfig")
+PYEOF
+
+          # Wire KSU into drivers/Makefile
+          if grep -q 'obj-.*kernelsu' drivers/Makefile; then
+            echo "OK: drivers/Makefile already has KSU obj line"
+          else
+            printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+            echo "OK: KSU obj injected into drivers/Makefile"
+          fi
+
+          echo "--- drivers/Kconfig (last 8 lines) ---"
+          tail -8 drivers/Kconfig
+          echo "--- drivers/Makefile (last 5 lines) ---"
+          tail -5 drivers/Makefile
+
+          grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig \
+            || { echo "ERROR: Kconfig injection failed"; exit 1; }
+          grep -q 'kernelsu' drivers/Makefile \
+            || { echo "ERROR: Makefile injection failed"; exit 1; }
+          echo "ALL KSU INTEGRATION CHECKS PASSED"
+
+      - name: Setup SuSFS
+        if: ${{ inputs.susfs == 'true' && inputs.kernelsu == 'true' }}
+        run: |
+          # Store ABSOLUTE path BEFORE any cd.
+          # BUG IN OLDER VERSIONS: using relative ../susfs4ksu after cd KernelSU-Next
+          # resolved to kernel_root/susfs4ksu (wrong) instead of workspace/susfs4ksu.
+          SUSFS_ROOT="$(pwd)/../susfs4ksu"
+
+          git clone --depth=1 \
+            https://gitlab.com/simonpunk/susfs4ksu.git \
+            -b gki-android13-5.15 \
+            "$SUSFS_ROOT"
+
+          echo "=== Available patch files ==="
+          ls "$SUSFS_ROOT/kernel_patches/"
+
+          # Copy SuSFS source files into the kernel tree
+          cp "$SUSFS_ROOT/kernel_patches/fs/susfs.c"            fs/
+          cp "$SUSFS_ROOT/kernel_patches/include/linux/susfs.h" include/linux/
+          echo "OK: susfs.c + susfs.h copied"
+
+          # Patch 10: wire SuSFS into KernelSU-Next driver source
+          echo "=== Applying 10_enable_susfs_for_ksu.patch ==="
+          cd KernelSU-Next
+          PATCH10="$SUSFS_ROOT/kernel_patches/10_enable_susfs_for_ksu.patch"
+          patch -p1 --dry-run < "$PATCH10" \
+            || { echo "ERROR: patch 10_ dry-run failed"; exit 1; }
+          patch -p1 < "$PATCH10"
+          echo "OK: patch 10_ applied"
+          cd ..
+
+          # Patch 50: wire SuSFS into kernel fs/ from kernel root
+          echo "=== Applying 50_add_susfs_in_gki-android13-5.15.patch ==="
+          PATCH50="$SUSFS_ROOT/kernel_patches/50_add_susfs_in_gki-android13-5.15.patch"
+          [ -f "$PATCH50" ] \
+            || { echo "ERROR: $PATCH50 not found"; ls "$SUSFS_ROOT/kernel_patches/"; exit 1; }
+          patch -p1 --dry-run < "$PATCH50" \
+            || { echo "ERROR: patch 50_ dry-run failed"; exit 1; }
+          patch -p1 < "$PATCH50"
+          echo "OK: patch 50_ applied"
+
+          grep -q "KSU_SUSFS" KernelSU-Next/kernel/Kconfig \
+            && echo "OK: KSU_SUSFS present in KSU Kconfig" \
+            || { echo "ERROR: KSU_SUSFS missing from Kconfig after patch 10_"; exit 1; }
+
+      - name: Generate base defconfig
+        run: |
+          make O=out ARCH=arm64 \
+            CC=clang LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            gki_defconfig
+
+      # IMPORTANT: use plain `echo` for every config line, NOT heredoc.
+      # BUG IN OLDER VERSIONS: heredoc inside a YAML `run:` block keeps
+      # the YAML indentation as literal whitespace. The resulting lines look
+      # like "          CONFIG_KSU=y" in .config. The Kconfig parser treats
+      # lines starting with whitespace as invalid and silently ignores them.
+      # olddefconfig then removes CONFIG_KSU from the final .config.
+      - name: Append KSU and SuSFS config options
+        run: |
+          CFG=out/.config
+
+          if [ "${{ inputs.kernelsu }}" == "true" ]; then
+            echo "CONFIG_OVERLAY_FS=y"       >> "$CFG"
+            echo "CONFIG_KSU=y"              >> "$CFG"
+            echo "CONFIG_KSU_WITH_KPROBES=y" >> "$CFG"
+            echo "CONFIG_KPROBES=y"          >> "$CFG"
+            echo "CONFIG_HAVE_KPROBES=y"     >> "$CFG"
+            echo "CONFIG_KPROBE_EVENTS=y"    >> "$CFG"
+            echo "CONFIG_KALLSYMS=y"         >> "$CFG"
+            echo "CONFIG_KALLSYMS_ALL=y"     >> "$CFG"
+            echo "OK: KSU options written"
+          fi
+
+          if [ "${{ inputs.susfs }}" == "true" ]; then
+            echo "CONFIG_KSU_SUSFS=y"             >> "$CFG"
+            echo "CONFIG_KSU_SUSFS_SUS_PATH=y"    >> "$CFG"
+            echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"   >> "$CFG"
+            echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"   >> "$CFG"
+            echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y"  >> "$CFG"
+            echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> "$CFG"
+            echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"  >> "$CFG"
+            echo "OK: SuSFS options written"
+          fi
+
+          make O=out ARCH=arm64 \
+            CC=clang LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            olddefconfig
+
+          echo "=== Final config ==="
+          grep -E "^CONFIG_(KSU|KSU_SUSFS|OVERLAY_FS|KPROBES|KALLSYMS)=" out/.config || true
+
+          if [ "${{ inputs.kernelsu }}" == "true" ]; then
+            if ! grep -q "^CONFIG_KSU=y" out/.config; then
+              echo ""
+              echo "CRITICAL: CONFIG_KSU=y dropped by olddefconfig"
+              echo "--- drivers/kernelsu symlink ---"
+              ls -la drivers/kernelsu 2>/dev/null || echo "(MISSING)"
+              echo "--- drivers/kernelsu/Kconfig (first 5 lines) ---"
+              head -5 drivers/kernelsu/Kconfig 2>/dev/null || echo "(MISSING)"
+              echo "--- drivers/Kconfig (last 10 lines) ---"
+              tail -10 drivers/Kconfig
+              exit 1
+            fi
+            echo "CONFIG_KSU=y confirmed in final config"
+          fi
+
+      - name: Build kernel
+        run: |
+          make O=out ARCH=arm64 \
+            CC=clang LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            KCFLAGS="-Wno-error=unused-variable -Wno-error=unused-function" \
+            -j$(nproc) 2>&1 | tee build.log
+
+          if [ ! -f out/arch/arm64/boot/Image ]; then
+            echo "CRITICAL: Image not found — build failed"
+            tail -200 build.log
+            exit 1
+          fi
+
+          echo "OK: build successful"
+          ls -lh out/arch/arm64/boot/Image
+          echo "=== Kernel version string ==="
+          strings out/arch/arm64/boot/Image | grep "Linux version" | head -3 || true
+
+      - name: Package with AnyKernel3
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 AnyKernel3
+          cp out/arch/arm64/boot/Image AnyKernel3/
+
+          find out/arch/arm64/boot/dts -name "*.dtb" \
+            -exec cp {} AnyKernel3/ \; 2>/dev/null || true
+
+          cd AnyKernel3
+          sed -i 's/do.devicecheck=1/do.devicecheck=0/' anykernel.sh
+
+          TAGS=""
+          [ "${{ inputs.kernelsu }}" == "true" ] && TAGS="${TAGS}-KSU"
+          [ "${{ inputs.susfs }}" == "true" ]    && TAGS="${TAGS}-SUSFS"
+          ZIP_NAME="kernel-sm8550${TAGS}-$(date +%Y%m%d-%H%M).zip"
+
+          zip -r9 "../${ZIP_NAME}" . -x '.git*'
+          cd ..
+          ls -lh "${ZIP_NAME}"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-sm8550-${{ github.run_number }}
+          path: |
+            kernel-sm8550-*.zip
+            out/arch/arm64/boot/Image
+            build.log
+          retention-days: 7
